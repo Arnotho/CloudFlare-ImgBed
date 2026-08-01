@@ -10,6 +10,30 @@ const OUTPUT_FORMATS = new Map([
     ['image/gif', 'image/gif'],
 ]);
 
+const OUTPUT_FORMAT_PRIORITY = [
+    'image/avif',
+    'image/webp',
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+];
+
+const OUTPUT_FORMAT_BY_NAME = new Map([
+    ['avif', 'image/avif'],
+    ['image/avif', 'image/avif'],
+    ['webp', 'image/webp'],
+    ['image/webp', 'image/webp'],
+    ['jpeg', 'image/jpeg'],
+    ['jpg', 'image/jpeg'],
+    ['jpe', 'image/jpeg'],
+    ['jfif', 'image/jpeg'],
+    ['image/jpeg', 'image/jpeg'],
+    ['png', 'image/png'],
+    ['image/png', 'image/png'],
+    ['gif', 'image/gif'],
+    ['image/gif', 'image/gif'],
+]);
+
 const IMAGE_TYPES_BY_EXTENSION = new Map([
     ['jpg', 'image/jpeg'],
     ['jpeg', 'image/jpeg'],
@@ -23,25 +47,26 @@ const IMAGE_TYPES_BY_EXTENSION = new Map([
     ['svgz', 'image/svg+xml'],
 ]);
 
-export function parseImageTransform(url, accessConfig = {}) {
+export function parseImageTransform(url, accessConfig = {}, acceptType = null) {
     const widthResult = parseDimension(url.searchParams, 'width');
     const heightResult = parseDimension(url.searchParams, 'height');
     const fitResult = parseFit(url.searchParams);
     const fallbackResult = parseFallback(url.searchParams);
+    const outputResult = parseOutput(url.searchParams, acceptType);
 
-    if (widthResult.error || heightResult.error || fitResult.error || fallbackResult.error) {
+    if (widthResult.error || heightResult.error || fitResult.error || fallbackResult.error || outputResult.error) {
         return {
             requested: true,
-            error: widthResult.error || heightResult.error || fitResult.error || fallbackResult.error,
+            error: widthResult.error || heightResult.error || fitResult.error || fallbackResult.error || outputResult.error,
         };
     }
 
-    const requested = widthResult.present || heightResult.present || fitResult.present || fallbackResult.present;
+    const requested = widthResult.present || heightResult.present || fitResult.present || fallbackResult.present || outputResult.present;
     if (!requested) {
         return { requested: false };
     }
 
-    if (fallbackResult.present && !widthResult.present && !heightResult.present && !fitResult.present) {
+    if (fallbackResult.present && !widthResult.present && !heightResult.present && !fitResult.present && !outputResult.present) {
         return {
             requested: true,
             error: 'fallback=original requires image resizing parameters',
@@ -81,6 +106,7 @@ export function parseImageTransform(url, accessConfig = {}) {
         requested: true,
         sizeKey,
         fallback: fallbackResult.value,
+        outputFormat: outputResult.value,
         options: {
             ...(width ? { width } : {}),
             ...(height ? { height } : {}),
@@ -146,8 +172,10 @@ export async function transformImageRequestViaUrl(context) {
     sourceUrl.searchParams.delete('height');
     sourceUrl.searchParams.delete('fit');
     sourceUrl.searchParams.delete('fallback');
+    sourceUrl.searchParams.delete('output');
 
     const transformOptions = Object.entries({
+        ...(imageTransform.outputFormat ? { format: mimeToTransformFormat(imageTransform.outputFormat) } : {}),
         ...imageTransform.options,
         ...(imageTransform.fallback === 'original' ? { onerror: 'redirect' } : {}),
     })
@@ -174,7 +202,7 @@ export async function transformImageResponse(context, response) {
     }
 
     const sourceType = normalizeContentType(response.headers.get('Content-Type'));
-    const outputFormat = OUTPUT_FORMATS.get(sourceType);
+    const outputFormat = resolveOutputFormat(context.request, sourceType, imageTransform.outputFormat);
     if (!canTransformImageType(context.env, sourceType)) {
         if (imageTransform.fallback === 'original') {
             return response;
@@ -324,6 +352,98 @@ function parseFallback(searchParams) {
     return { present: true, value: values[0] };
 }
 
+function parseOutput(searchParams, acceptType = null) {
+    const values = searchParams.getAll('output');
+    if (values.length > 0) {
+        if (values.length !== 1) {
+            return { present: true, error: 'Duplicate output parameter' };
+        }
+
+        const normalized = normalizeOutputFormat(values[0]);
+        if (!normalized) {
+            return { present: true, error: 'output must be one of avif, webp, jpeg, jpg, png, gif' };
+        }
+
+        return { present: true, value: normalized };
+    }
+
+    const value = resolvePreferredOutputFormat(acceptType);
+    return { present: Boolean(value), value };
+}
+
+function normalizeOutputFormat(value) {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return null;
+    return OUTPUT_FORMAT_BY_NAME.get(normalized) || null;
+}
+
+function resolvePreferredOutputFormat(acceptHeader) {
+    if (!acceptHeader) return null;
+
+    const entries = [];
+    for (const item of acceptHeader.split(',')) {
+        const [mediaType, ...params] = item.split(';').map(part => part.trim());
+        const normalizedMediaType = (mediaType || '').trim().toLowerCase();
+        if (!normalizedMediaType) continue;
+
+        let qValue = 1;
+        for (const param of params) {
+            const [key, rawValue] = param.split('=').map(part => part.trim().toLowerCase());
+            if (key === 'q' && rawValue) {
+                const parsed = Number.parseFloat(rawValue);
+                if (Number.isFinite(parsed)) qValue = parsed;
+            }
+        }
+
+        if (normalizedMediaType === '*/*' || normalizedMediaType === 'image/*') {
+            entries.push({ q: qValue, type: normalizedMediaType, priority: -1 });
+            continue;
+        }
+
+        const normalizedFormat = normalizeOutputFormat(normalizedMediaType);
+        if (!normalizedFormat) continue;
+        entries.push({ q: qValue, type: normalizedFormat, priority: OUTPUT_FORMAT_PRIORITY.indexOf(normalizedFormat) });
+    }
+
+    entries.filter(entry => entry.q > 0);
+    if (entries.length === 0) return null;
+    entries.sort((a, b) => {
+        if (b.q !== a.q) return b.q - a.q;
+        if (a.priority !== b.priority) return a.priority - b.priority;
+        return 0;
+    });
+
+    const best = entries[0];
+    if (best.type === '*/*' || best.type === 'image/*') {
+        return OUTPUT_FORMAT_PRIORITY[0];
+    }
+    return best.type;
+}
+
+function resolveOutputFormat(request, sourceType, requestedFormat) {
+    if (requestedFormat) {
+        return requestedFormat;
+    }
+
+    const acceptHeader = request?.headers?.get('Accept');
+    const preferred = resolvePreferredOutputFormat(acceptHeader);
+    if (preferred) {
+        return preferred;
+    }
+
+    return OUTPUT_FORMATS.get(sourceType) || sourceType || null;
+}
+
+function mimeToTransformFormat(value) {
+    if (!value) return null;
+    const format = value.toLowerCase();
+    if (format.startsWith('image/')) {
+        return format.replace(/^image\//, '');
+    }
+    return format;
+}
+
 function parseAllowedSizes(value) {
     if (typeof value !== 'string' || value.trim() === '') return new Set();
 
@@ -362,6 +482,7 @@ function mergeTransformedHeaders(sourceHeaders, transformedHeaders, outputFormat
     headers.delete('Accept-Ranges');
     headers.delete('ETag');
     removeVaryToken(headers, 'Range');
+    addVaryToken(headers, 'Accept');
 
     for (const name of ['Content-Length', 'ETag']) {
         const value = transformedHeaders.get(name);
@@ -385,6 +506,18 @@ function removeVaryToken(headers, tokenToRemove) {
         headers.set('Vary', remaining.join(', '));
     } else {
         headers.delete('Vary');
+    }
+}
+
+function addVaryToken(headers, tokenToAdd) {
+    const vary = headers.get('Vary');
+    const values = vary ? vary.split(',').map(token => token.trim()).filter(Boolean) : [];
+    const normalized = tokenToAdd.trim();
+    if (!normalized) return;
+
+    if (!values.some(token => token.toLowerCase() === normalized.toLowerCase())) {
+        values.push(normalized);
+        headers.set('Vary', values.join(', '));
     }
 }
 

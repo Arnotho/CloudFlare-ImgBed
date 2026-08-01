@@ -53,7 +53,7 @@ export async function onRequest(context) {  // Contents of context object
     const url = new URL(request.url);
     context.url = url;
 
-    context.imageTransform = parseImageTransform(url, securityConfig.access);
+    context.imageTransform = parseImageTransform(url, securityConfig.access, request.headers.get('Accept'));
     const imageTransformError = validateImageTransformRequest(request, context.imageTransform);
     if (imageTransformError) {
         return imageTransformError;
