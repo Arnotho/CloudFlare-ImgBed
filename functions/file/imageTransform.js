@@ -48,11 +48,12 @@ const IMAGE_TYPES_BY_EXTENSION = new Map([
 ]);
 
 export function parseImageTransform(url, accessConfig = {}, acceptType = null) {
+    const defaultFormatMode = normalizeDefaultFormatMode(accessConfig.imageTransformDefaultFormat);
     const widthResult = parseDimension(url.searchParams, 'width');
     const heightResult = parseDimension(url.searchParams, 'height');
     const fitResult = parseFit(url.searchParams);
     const fallbackResult = parseFallback(url.searchParams);
-    const outputResult = parseOutput(url.searchParams, acceptType);
+    const outputResult = parseOutput(url.searchParams, acceptType, defaultFormatMode);
 
     if (widthResult.error || heightResult.error || fitResult.error || fallbackResult.error || outputResult.error) {
         return {
@@ -352,7 +353,7 @@ function parseFallback(searchParams) {
     return { present: true, value: values[0] };
 }
 
-function parseOutput(searchParams, acceptType = null) {
+function parseOutput(searchParams, acceptType = null, defaultFormatMode = 'auto') {
     const values = searchParams.getAll('output');
     if (values.length > 0) {
         if (values.length !== 1) {
@@ -367,8 +368,18 @@ function parseOutput(searchParams, acceptType = null) {
         return { present: true, value: normalized };
     }
 
+    if (defaultFormatMode === 'none') {
+        return { present: false, value: null };
+    }
+
     const value = resolvePreferredOutputFormat(acceptType);
     return { present: Boolean(value), value };
+}
+
+function normalizeDefaultFormatMode(value) {
+    if (typeof value !== 'string') return 'auto';
+    const normalized = value.trim().toLowerCase();
+    return normalized === 'none' ? 'none' : 'auto';
 }
 
 function normalizeOutputFormat(value) {
