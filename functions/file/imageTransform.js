@@ -1,3 +1,5 @@
+import { IMAGE_TYPES_BY_EXTENSION, getFileExtension, normalizeMimeType } from '../utils/mimeTypes.js';
+
 const MAX_IMAGE_DIMENSION = 4096;
 const MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024;
 
@@ -32,19 +34,6 @@ const OUTPUT_FORMAT_BY_NAME = new Map([
     ['image/png', 'image/png'],
     ['gif', 'image/gif'],
     ['image/gif', 'image/gif'],
-]);
-
-const IMAGE_TYPES_BY_EXTENSION = new Map([
-    ['jpg', 'image/jpeg'],
-    ['jpeg', 'image/jpeg'],
-    ['jpe', 'image/jpeg'],
-    ['jfif', 'image/jpeg'],
-    ['png', 'image/png'],
-    ['webp', 'image/webp'],
-    ['avif', 'image/avif'],
-    ['gif', 'image/gif'],
-    ['svg', 'image/svg+xml'],
-    ['svgz', 'image/svg+xml'],
 ]);
 
 export function parseImageTransform(url, accessConfig = {}, acceptType = null) {
@@ -141,7 +130,7 @@ export function validateImageTransformSource(imageTransform, env, fileType, file
         return null;
     }
 
-    const metadataType = normalizeContentType(fileType);
+    const metadataType = normalizeMimeType(fileType);
     const inferredType = metadataType || inferImageTypeFromFileName(fileName);
     if (!inferredType || canTransformImageType(env, inferredType)) {
         return null;
@@ -202,7 +191,7 @@ export async function transformImageResponse(context, response) {
         return response;
     }
 
-    const sourceType = normalizeContentType(response.headers.get('Content-Type'));
+    const sourceType = normalizeMimeType(response.headers.get('Content-Type'));
     const outputFormat = resolveOutputFormat(context.request, sourceType, imageTransform.outputFormat);
     if (!canTransformImageType(context.env, sourceType)) {
         if (imageTransform.fallback === 'original') {
@@ -466,17 +455,11 @@ function parseAllowedSizes(value) {
     );
 }
 
-function normalizeContentType(contentType) {
-    return (contentType || '').split(';', 1)[0].trim().toLowerCase();
-}
-
 function inferImageTypeFromFileName(fileName) {
     if (typeof fileName !== 'string') return null;
 
-    const match = /\.([^.\/\\]+)$/.exec(fileName.trim());
-    if (!match) return null;
-
-    return IMAGE_TYPES_BY_EXTENSION.get(match[1].toLowerCase()) || 'unknown';
+    const extension = getFileExtension(fileName);
+    return extension ? IMAGE_TYPES_BY_EXTENSION.get(extension) || 'unknown' : null;
 }
 
 function parseContentLength(value) {
