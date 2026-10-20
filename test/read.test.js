@@ -149,12 +149,88 @@ describe('read and list files', () => {
                     range: options?.range,
                     writeHttpMetadata(headers) { headers.set('Content-Type', 'application/octet-stream'); },
                 });
+                ctx.env.img_r2.head = async () => ({
+                    size: 6,
+                    httpEtag: '"r2-etag"',
+                    writeHttpMetadata(headers) { headers.set('Content-Type', 'application/octet-stream'); },
+                });
                 const response = await route.onRequest(ctx);
                 assert.equal(response.status, range ? 206 : 200);
                 assert.equal(response.headers.get('Content-Type'), expected);
                 assert.equal(await response.text(), method === 'HEAD' ? '' : range ? 'so' : 'source');
                 if (range) assert.equal(response.headers.get('Content-Range'), 'bytes 0-1/6');
+                if (method === 'HEAD') assert.equal(response.headers.get('Content-Length'), '6');
             }
+        }
+    });
+
+    it('parses single byte ranges per RFC 9110', () => {
+        const { parseRangeHeader } = fileTools;
+        assert.deepEqual(parseRangeHeader('bytes=0-1', 10), { start: 0, end: 1 });
+        assert.deepEqual(parseRangeHeader('bytes=4-', 10), { start: 4, end: 9 });
+        assert.deepEqual(parseRangeHeader('bytes=-3', 10), { start: 7, end: 9 });
+        assert.deepEqual(parseRangeHeader('bytes=-30', 10), { start: 0, end: 9 });
+        assert.deepEqual(parseRangeHeader('bytes=2-999', 10), { start: 2, end: 9 });
+        for (const header of [null, '', 'bytes=', 'bytes=-', 'items=0-1', 'bytes=5-2', 'bytes=0-1,4-5']) {
+            assert.equal(parseRangeHeader(header, 10), null, header);
+        }
+        for (const header of ['bytes=10-', 'bytes=10-20', 'bytes=-0']) {
+            assert.deepEqual(parseRangeHeader(header, 10), { unsatisfiable: true }, header);
+        }
+        assert.deepEqual(parseRangeHeader('bytes=-5', 0), { unsatisfiable: true });
+    });
+
+    it('serves suffix, clamped and unsatisfiable R2 ranges for media seeking', async () => {
+        const route = await loadFunction('functions/file/[[path]].js', {
+            ...mocks, ...fileTools, ...imageTransform,
+            fetchSecurityConfig: async () => ({ access: { whiteListMode: false } }),
+        });
+        const content = '0123456789';
+        await db.put('clip.mp4', '', { metadata: { Channel: 'CloudflareR2', FileName: 'clip.mp4', FileType: 'video/mp4' } });
+        for (const [header, status, body, contentRange] of [
+            ['bytes=-3', 206, '789', 'bytes 7-9/10'],
+            ['bytes=4-999', 206, '456789', 'bytes 4-9/10'],
+            ['bytes=10-', 416, null, 'bytes */10'],
+            ['bytes=0-1,4-5', 200, content, null],
+        ]) {
+            const ctx = createContext('https://test/file/clip.mp4', { params: { path: 'clip.mp4' }, headers: { Range: header } });
+            ctx.env.img_r2 = {
+                async head() { return { size: content.length, writeHttpMetadata() {} }; },
+                async get(id, options) {
+                    if (status === 416) assert.fail('should not read an unsatisfiable range');
+                    const { offset = 0, length = content.length } = options?.range || {};
+                    return { body: new Response(content.slice(offset, offset + length)).body, size: content.length, writeHttpMetadata() {} };
+                },
+            };
+            const response = await route.onRequest(ctx);
+            assert.equal(response.status, status, header);
+            assert.equal(response.headers.get('Content-Range'), contentRange, header);
+            if (body !== null) assert.equal(await response.text(), body, header);
+        }
+    });
+
+    it('clamps ranges that run past the end of chunked Telegram files', async () => {
+        const chunkData = { a: '01234', b: '56789' };
+        const route = await loadFunction('functions/file/[[path]].js', {
+            ...mocks, ...fileTools, ...imageTransform,
+            fetchSecurityConfig: async () => ({ access: { whiteListMode: false } }),
+            resolveTelegramCredentials: async () => ({ botToken: 'token' }),
+            TelegramAPI: class { async getFileContent(fileId) { return new Response(chunkData[fileId]); } },
+        });
+        await db.put('movie.mp4', JSON.stringify([
+            { index: 0, fileId: 'a', size: 5 },
+            { index: 1, fileId: 'b', size: 5 },
+        ]), { metadata: { Channel: 'TelegramNew', IsChunked: true, TotalChunks: 2, FileName: 'movie.mp4', FileType: 'video/mp4' } });
+        for (const [header, status, body, contentRange] of [
+            ['bytes=3-999999', 206, '3456789', 'bytes 3-9/10'],
+            ['bytes=-2', 206, '89', 'bytes 8-9/10'],
+            ['bytes=12-', 416, null, 'bytes */10'],
+        ]) {
+            const ctx = createContext('https://test/file/movie.mp4', { params: { path: 'movie.mp4' }, headers: { Range: header } });
+            const response = await route.onRequest(ctx);
+            assert.equal(response.status, status, header);
+            assert.equal(response.headers.get('Content-Range'), contentRange, header);
+            if (body !== null) assert.equal(await response.text(), body, header);
         }
     });
 });

@@ -56,6 +56,23 @@ export function parseImageTransform(url, accessConfig = {}, acceptType = null) {
         return { requested: false };
     }
 
+    // 仅由 Accept 自动触发的格式转换：未启用时直接返回原文件，转换失败时回退到原文件
+    const explicitlyRequested = widthResult.present || heightResult.present || fitResult.present || fallbackResult.present || !outputResult.implicit;
+    if (!explicitlyRequested) {
+        if (accessConfig.imageTransformEnabled !== true) {
+            return { requested: false };
+        }
+
+        return {
+            requested: true,
+            implicit: true,
+            sizeKey: 'autoxauto',
+            fallback: 'original',
+            outputFormat: outputResult.value,
+            options: {},
+        };
+    }
+
     if (fallbackResult.present && !widthResult.present && !heightResult.present && !fitResult.present && !outputResult.present) {
         return {
             requested: true,
@@ -361,8 +378,9 @@ function parseOutput(searchParams, acceptType = null, defaultFormatMode = 'auto'
         return { present: false, value: null };
     }
 
+    // 根据 Accept 自动选择的格式只是可选优化，标记为 implicit
     const value = resolvePreferredOutputFormat(acceptType);
-    return { present: Boolean(value), value };
+    return { present: Boolean(value), value, implicit: Boolean(value) };
 }
 
 function normalizeDefaultFormatMode(value) {
@@ -406,15 +424,15 @@ function resolvePreferredOutputFormat(acceptHeader) {
         entries.push({ q: qValue, type: normalizedFormat, priority: OUTPUT_FORMAT_PRIORITY.indexOf(normalizedFormat) });
     }
 
-    entries.filter(entry => entry.q > 0);
-    if (entries.length === 0) return null;
-    entries.sort((a, b) => {
+    const acceptedEntries = entries.filter(entry => entry.q > 0);
+    if (acceptedEntries.length === 0) return null;
+    acceptedEntries.sort((a, b) => {
         if (b.q !== a.q) return b.q - a.q;
         if (a.priority !== b.priority) return a.priority - b.priority;
         return 0;
     });
 
-    const best = entries[0];
+    const best = acceptedEntries[0];
     if (best.type === '*/*' || best.type === 'image/*') {
         return OUTPUT_FORMAT_PRIORITY[0];
     }

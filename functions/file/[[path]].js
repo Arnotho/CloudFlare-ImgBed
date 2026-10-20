@@ -7,6 +7,7 @@ import { HuggingFaceAPI } from "../utils/storage/huggingfaceAPI";
 import { buildWebDAVUrl, WebDAVAPI } from "../utils/storage/webdavAPI";
 import {
     setCommonHeaders, setRangeHeaders, handleHeadRequest, getFileContent, isTgChannel,
+    parseRangeHeader, rangeNotSatisfiable,
     returnWithCheck, return404, returnBlockImg, isDomainAllowed, FILE_CACHE_CONTROL
 } from './fileTools';
 import { getDatabase } from '../utils/databaseAdapter.js';
@@ -56,6 +57,10 @@ export async function onRequest(context) {  // Contents of context object
     context.url = url;
 
     context.imageTransform = parseImageTransform(url, securityConfig.access, request.headers.get('Accept'));
+    // 根据 Accept 自动转换格式只适用于完整的 GET 请求，HEAD 和 Range（如视频拖动）直接返回原文件
+    if (context.imageTransform.implicit && (request.method !== 'GET' || request.headers.has('Range'))) {
+        context.imageTransform = { requested: false };
+    }
     const imageTransformError = validateImageTransformRequest(request, context.imageTransform);
     if (imageTransformError) {
         return imageTransformError;
@@ -321,24 +326,13 @@ async function handleTelegramChunkedFile(context, imgRecord, encodedFileName, fi
     }
 
     // 检查Range请求头
-    const range = request.headers.get('Range');
-    let rangeStart = 0;
-    let rangeEnd = totalSize - 1;
-    let isRangeRequest = false;
-
-    if (range) {
-        const matches = range.match(/bytes=(\d+)-(\d*)/);
-        if (matches) {
-            rangeStart = parseInt(matches[1]);
-            rangeEnd = matches[2] ? parseInt(matches[2]) : totalSize - 1;
-            isRangeRequest = true;
-
-            // 验证范围有效性
-            if (rangeStart >= totalSize || rangeEnd >= totalSize || rangeStart > rangeEnd) {
-                return new Response('Range Not Satisfiable', { status: 416 });
-            }
-        }
+    const parsedRange = parseRangeHeader(request.headers.get('Range'), totalSize);
+    if (parsedRange?.unsatisfiable) {
+        return rangeNotSatisfiable(totalSize);
     }
+    const isRangeRequest = parsedRange !== null;
+    const rangeStart = isRangeRequest ? parsedRange.start : 0;
+    const rangeEnd = isRangeRequest ? parsedRange.end : totalSize - 1;
 
     // 处理HEAD请求
     if (request.method === 'HEAD') {
@@ -515,24 +509,13 @@ async function handleDiscordChunkedFile(context, imgRecord, encodedFileName, fil
     }
 
     // 检查Range请求头
-    const range = request.headers.get('Range');
-    let rangeStart = 0;
-    let rangeEnd = totalSize - 1;
-    let isRangeRequest = false;
-
-    if (range) {
-        const matches = range.match(/bytes=(\d+)-(\d*)/);
-        if (matches) {
-            rangeStart = parseInt(matches[1]);
-            rangeEnd = matches[2] ? parseInt(matches[2]) : totalSize - 1;
-            isRangeRequest = true;
-
-            // 验证范围有效性
-            if (rangeStart >= totalSize || rangeEnd >= totalSize || rangeStart > rangeEnd) {
-                return new Response('Range Not Satisfiable', { status: 416 });
-            }
-        }
+    const parsedRange = parseRangeHeader(request.headers.get('Range'), totalSize);
+    if (parsedRange?.unsatisfiable) {
+        return rangeNotSatisfiable(totalSize);
     }
+    const isRangeRequest = parsedRange !== null;
+    const rangeStart = isRangeRequest ? parsedRange.start : 0;
+    const rangeEnd = isRangeRequest ? parsedRange.end : totalSize - 1;
 
     // 处理HEAD请求
     if (request.method === 'HEAD') {
@@ -672,33 +655,37 @@ async function handleR2File(context, fileId, encodedFileName, fileType) {
 
         const R2DataBase = env.img_r2;
 
-        // 检查Range请求头
-        const range = request.headers.get('Range');
-        let object;
-
-        if (range) {
-            // 处理Range请求
-            const matches = range.match(/bytes=(\d+)-(\d*)/);
-            if (matches) {
-                const start = parseInt(matches[1]);
-                const end = matches[2] ? parseInt(matches[2]) : undefined;
-
-                const rangeOptions = {
-                    range: {
-                        offset: start
-                    }
-                };
-                if (end !== undefined) {
-                    rangeOptions.range.length = end - start + 1;
-                }
-
-                object = await R2DataBase.get(fileId, rangeOptions);
-            } else {
-                object = await R2DataBase.get(fileId);
+        // 处理HEAD请求：只读取元数据，不下载文件内容
+        if (request.method === 'HEAD') {
+            const object = await R2DataBase.head(fileId);
+            if (object === null) {
+                return new Response('Error: Failed to fetch file', { status: 500 });
             }
-        } else {
-            object = await R2DataBase.get(fileId);
+
+            const headers = new Headers();
+            object.writeHttpMetadata(headers);
+            setCommonHeaders(headers, encodedFileName, fileType, getFileCacheControl(context));
+            headers.set('Content-Length', object.size.toString());
+            return handleHeadRequest(headers, object.httpEtag);
         }
+
+        // 检查Range请求头：先读取文件大小，再按 RFC 9110 计算实际范围
+        let parsedRange = null;
+        if (request.headers.get('Range')) {
+            const objectInfo = await R2DataBase.head(fileId);
+            if (objectInfo === null) {
+                return new Response('Error: Failed to fetch file', { status: 500 });
+            }
+
+            parsedRange = parseRangeHeader(request.headers.get('Range'), objectInfo.size);
+            if (parsedRange?.unsatisfiable) {
+                return rangeNotSatisfiable(objectInfo.size);
+            }
+        }
+
+        const object = parsedRange
+            ? await R2DataBase.get(fileId, { range: { offset: parsedRange.start, length: parsedRange.end - parsedRange.start + 1 } })
+            : await R2DataBase.get(fileId);
 
         if (object === null) {
             return new Response('Error: Failed to fetch file', { status: 500 });
@@ -708,15 +695,9 @@ async function handleR2File(context, fileId, encodedFileName, fileType) {
         object.writeHttpMetadata(headers);
         setCommonHeaders(headers, encodedFileName, fileType, getFileCacheControl(context));
 
-        // 处理HEAD请求
-        if (request.method === 'HEAD') {
-            return handleHeadRequest(headers);
-        }
-
         // 如果是Range请求，设置相应的状态码和头
-        if (range && object.range) {
-            headers.set('Content-Range', `bytes ${object.range.offset}-${object.range.offset + object.range.length - 1}/${object.size}`);
-            headers.set('Content-Length', object.range.length.toString());
+        if (parsedRange) {
+            setRangeHeaders(headers, parsedRange.start, parsedRange.end, object.size);
 
             return new Response(object.body, {
                 status: 206, // Partial Content
@@ -856,14 +837,17 @@ async function handleS3FileViaAPI(context, metadata, encodedFileName, fileType) 
             return handleHeadRequest(headers);
         }
 
-        // 返回响应，支持流式传输
-        const statusCode = range ? 206 : 200; // Range请求返回206 Partial Content
+        // 返回响应，支持流式传输；只有 S3 实际返回部分内容时才使用 206
+        const statusCode = response.ContentRange ? 206 : 200;
         return new Response(response.Body, {
             status: statusCode,
             headers
         });
 
     } catch (error) {
+        if (error.name === 'InvalidRange' || error.$metadata?.httpStatusCode === 416) {
+            return rangeNotSatisfiable();
+        }
         return new Response(`Error: Failed to fetch from S3 - ${error.message}`, { status: 500 });
     }
 }
