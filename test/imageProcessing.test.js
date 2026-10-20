@@ -36,4 +36,18 @@ describe('image processing', () => {
         assert.equal(response.headers.get('Cache-Control'), 'private');
         assert.equal(await response.text(), 'scaled');
     });
+
+    it('treats Accept-based output formats as optional so non-image and disabled requests serve the original', () => {
+        const url = new URL('https://test/file/clip.mp4');
+        for (const accept of ['*/*', 'image/avif,image/webp,image/*,*/*;q=0.8']) {
+            assert.deepEqual(parseImageTransform(url, {}, accept), { requested: false });
+        }
+        const implicit = parseImageTransform(url, { imageTransformEnabled: true, imageTransformAllowedSizes: '100xauto' }, '*/*');
+        assert.equal(implicit.implicit, true);
+        assert.equal(implicit.fallback, 'original');
+        assert.equal(implicit.outputFormat, 'image/avif');
+        assert.deepEqual(validateImageTransformSource(implicit, {}, 'video/mp4', 'clip.mp4'), { fallbackToOriginal: true });
+        assert.equal(parseImageTransform(url, { imageTransformEnabled: true }, 'image/avif;q=0,image/png').outputFormat, 'image/png');
+        assert.equal(parseImageTransform(new URL('https://test/file/a.jpg?output=webp'), {}, '*/*').errorStatus, 403);
+    });
 });

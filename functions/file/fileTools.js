@@ -75,6 +75,45 @@ export function setRangeHeaders(headers, rangeStart, rangeEnd, totalSize) {
     headers.set('Content-Range', `bytes ${rangeStart}-${rangeEnd}/${totalSize}`);
 }
 
+// 按 RFC 9110 解析单段 Range 请求头，支持 bytes=a-b、bytes=a- 和 bytes=-n。
+// 返回 null 表示忽略 Range 并返回完整文件（无 Range、格式无效或多段 Range），
+// 返回 { unsatisfiable: true } 表示应返回 416，否则返回闭区间 { start, end }。
+export function parseRangeHeader(rangeHeader, totalSize) {
+    const matches = /^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$/i.exec(rangeHeader || '');
+    if (!matches || (matches[1] === '' && matches[2] === '')) {
+        return null;
+    }
+
+    // 后缀范围：请求最后 n 个字节
+    if (matches[1] === '') {
+        const suffixLength = Number(matches[2]);
+        if (suffixLength === 0 || totalSize === 0) {
+            return { unsatisfiable: true };
+        }
+        return { start: Math.max(0, totalSize - suffixLength), end: totalSize - 1 };
+    }
+
+    const start = Number(matches[1]);
+    const requestedEnd = matches[2] === '' ? null : Number(matches[2]);
+    if (requestedEnd !== null && requestedEnd < start) {
+        return null;
+    }
+    if (start >= totalSize) {
+        return { unsatisfiable: true };
+    }
+
+    // 结束位置超出文件大小时截断到文件末尾
+    const end = requestedEnd === null ? totalSize - 1 : Math.min(requestedEnd, totalSize - 1);
+    return { start, end };
+}
+
+// 返回 416 Range Not Satisfiable
+export function rangeNotSatisfiable(totalSize = null) {
+    const headers = new Headers({ 'Accept-Ranges': 'bytes' });
+    headers.set('Content-Range', `bytes */${totalSize ?? '*'}`);
+    return new Response('Range Not Satisfiable', { status: 416, headers });
+}
+
 // 处理HEAD请求的公共函数
 export function handleHeadRequest(headers, etag = null) {
     const responseHeaders = new Headers();

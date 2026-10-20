@@ -56,6 +56,22 @@ export class LocalR2Storage {
     }
 
     /**
+     * 获取文件元数据（模拟 R2 的 head 方法）
+     */
+    async head(key) {
+        const filePath = this._filePath(key);
+        if (!existsSync(filePath)) return null;
+
+        return {
+            size: statSync(filePath).size,
+            httpMetadata: {},
+            writeHttpMetadata(headers) {
+                // 本地存储不设置额外的 HTTP 元数据
+            }
+        };
+    }
+
+    /**
      * 存储文件（模拟 R2 的 put 方法）
      * 支持多种输入类型
      */
