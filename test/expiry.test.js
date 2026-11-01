@@ -236,7 +236,10 @@ describe('file expiry', () => {
         });
 
         function r2Env(reads = []) {
-            return { img_r2: { async get(id) { reads.push(id); return { body: new Response('x').body, size: 1, writeHttpMetadata() {} }; } } };
+            return { img_r2: {
+                async get(id) { reads.push(['get', id]); return { body: new Response('x').body, size: 1, writeHttpMetadata() {} }; },
+                async head(id) { reads.push(['head', id]); return { size: 1, writeHttpMetadata() {} }; },
+            } };
         }
 
         function request(id, { method = 'GET', headers = {}, env = r2Env() } = {}) {
@@ -259,10 +262,13 @@ describe('file expiry', () => {
             const etag = helpers.buildExpiringFileEtag(metadata);
 
             for (const method of ['GET', 'HEAD']) {
-                const response = await request('week.png', { method });
+                const reads = [];
+                const response = await request('week.png', { method, env: r2Env(reads) });
                 assert.equal(response.status, 200, method);
                 assert.equal(response.headers.get('ETag'), etag, method);
                 assert.equal(response.headers.get('Cache-Control'), 'private, max-age=3600', method);
+                assert.deepEqual(reads, [[method === 'HEAD' ? 'head' : 'get', 'week.png']], method);
+                assert.equal(await response.text(), method === 'HEAD' ? '' : 'x', method);
             }
 
             const reads = [];
